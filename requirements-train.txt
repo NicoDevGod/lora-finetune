@@ -1,0 +1,6 @@
+torch==2.4.1
+transformers==4.45.2
+peft==0.13.2
+safetensors==0.4.5
+optimum[onnxruntime]==2.1.0
+onnxruntime==1.23.2

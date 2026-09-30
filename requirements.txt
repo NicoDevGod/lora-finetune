@@ -1,5 +1,4 @@
-torch==2.4.1
+onnxruntime==1.23.2
+optimum[onnxruntime]==2.1.0
 transformers==4.45.2
-peft==0.13.2
 gradio==5.50.0
-safetensors==0.4.5
