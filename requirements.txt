@@ -1,3 +1,4 @@
+torch==2.14.1+cpu
 onnxruntime==1.23.2
 optimum[onnxruntime]==2.1.0
 transformers==4.45.2
