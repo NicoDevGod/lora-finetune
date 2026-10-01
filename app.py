@@ -9,12 +9,27 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+import sys
 from pathlib import Path
+
+import psutil
+
+_proc = psutil.Process(os.getpid())
+
+
+def _log_mem(label):
+    rss = _proc.memory_info().rss / 1024 / 1024
+    print(f"[MEM] {label}: {rss:.1f} MB", file=sys.stderr, flush=True)
+
+
+_log_mem("process start")
 
 import onnxruntime as ort
 from optimum.onnxruntime import ORTModelForCausalLM
 from transformers import AutoTokenizer
 import gradio as gr
+
+_log_mem("after imports")
 
 ONNX_DIR = Path(__file__).parent / "onnx_lora"
 MAX_NEW_TOKENS = 24
@@ -46,7 +61,9 @@ def load_model():
     session_options.inter_op_num_threads = 1
 
     tokenizer = AutoTokenizer.from_pretrained(ONNX_DIR)
+    _log_mem("after tokenizer loaded")
     model = ORTModelForCausalLM.from_pretrained(ONNX_DIR, session_options=session_options)
+    _log_mem("after model loaded")
     return tokenizer, model
 
 
@@ -54,11 +71,14 @@ def make_generate_fn(tokenizer, model):
     def generate(prompt):
         if not prompt:
             return "Escribe un inicio de frase primero.", ""
+        _log_mem("generate() start")
         inputs = tokenizer(prompt, return_tensors="pt")
+        _log_mem("after tokenize")
         output_ids = model.generate(
             **inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=True,
             temperature=0.8, top_p=0.9, pad_token_id=tokenizer.eos_token_id,
         )
+        _log_mem("after generate() returns")
         lora_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         base_text = BASE_EXAMPLES.get(
             prompt,

@@ -3,3 +3,4 @@ onnxruntime==1.23.2
 optimum[onnxruntime]==2.1.0
 transformers==4.45.2
 gradio==5.50.0
+psutil==6.1.0
