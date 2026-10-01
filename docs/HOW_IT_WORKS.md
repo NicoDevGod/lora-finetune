@@ -101,6 +101,11 @@ GitHub normal, sin necesitar Git LFS ni alojarlo aparte.
 
 ## Exportación — [`export_onnx.py`](../export_onnx.py)
 
+> **Nota:** la primera versión de `app.py` usaba `optimum.onnxruntime.ORTModelForCausalLM`
+> para la inferencia (ver troubleshooting 3 más abajo para por qué se reemplazó
+> por `onnxruntime` puro). El proceso de exportación que sigue no cambió — solo
+> cambió qué librería *consume* el ONNX resultante en producción.
+
 Este script no existía en la primera versión del proyecto — se agregó
 después de que el primer deploy a Render se cayera por memoria (ver
 troubleshooting más abajo). Hace tres cosas, para **dos** modelos (el
@@ -126,20 +131,43 @@ quantize_dynamic(onnx_path, quantized_path, weight_type=QuantType.QUInt8)
 
 ## Inferencia — [`app.py`](../app.py)
 
+La versión final no usa `optimum` ni `transformers` ni `torch` — solo
+`onnxruntime` (para correr el modelo) y `tokenizers` (la librería liviana de
+Hugging Face que solo tokeniza, sin cargar ningún framework de modelos
+encima). El motivo está en el troubleshooting 3 más abajo; acá va el cómo.
+
+### El loop de decodificación a mano (`generate_text`, línea ~95)
+
+Un modelo de lenguaje con *KV-cache* no genera todo el texto de una sola
+pasada — genera **un token a la vez**, y cada paso reutiliza lo ya calculado
+en los pasos anteriores en vez de recalcularlo:
+
 ```python
-session_options = ort.SessionOptions()
-session_options.enable_mem_pattern = False
-session_options.enable_cpu_mem_arena = False
-model = ORTModelForCausalLM.from_pretrained(ONNX_DIR, session_options=session_options)
+feeds = {"input_ids": step_input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
+feeds.update(past)                      # el cache de todos los pasos anteriores
+outputs = session.run(None, feeds)
+logits = outputs[0][0, -1]               # probabilidades del próximo token
+next_token = _sample_next_token(logits, temperature, top_p, rng)
+# guardar el cache actualizado (outputs[1:]) para el siguiente paso
 ```
 
-`ORTModelForCausalLM` (de `optimum`) expone la misma interfaz `.generate()`
-que un modelo de `transformers` normal — el código que llama a generar
-texto no cambió casi nada respecto a la primera versión con `torch` puro,
-solo cambió qué clase carga el modelo. Ver el troubleshooting de memoria
-más abajo para por qué las dos líneas de `session_options` son necesarias,
-y por qué la app compara contra un ejemplo del modelo base ya capturado
-en vez de generarlo también en vivo.
+`_empty_past()` arma el cache inicial vacío (forma `(1, 12, 0, 64)` — cero
+tokens de historia, 12 cabezas de atención, 64 números por cabeza, uno por
+cada una de las 6 capas de distilgpt2 ×2 porque cada capa guarda tanto
+`key` como `value`). Después de cada paso, el cache crece en uno: por eso
+`past_sequence_length` aparece en la forma de los tensores de entrada y
+salida del modelo ONNX (ver la inspección de `model.onnx` con
+`session.get_inputs()`/`get_outputs()`).
+
+### Muestreo top-p a mano (`_sample_next_token`, línea ~75)
+
+`transformers.generate()` hace esto internamente; acá son quince líneas de
+numpy — ordenar las probabilidades de mayor a menor, quedarse con las
+primeras que suman `top_p` de probabilidad acumulada (el "núcleo"), y
+elegir entre esas con `np.random.Generator.choice`. El mismo patrón que ya
+apareció en el proyecto del detector de objetos (reimplementar NMS en vez
+de instalar `torchvision`): una función chica reimplementada a mano evita
+instalar un framework entero solo para usar esa función.
 
 ---
 
@@ -229,16 +257,79 @@ modelo con LoRA en vivo (el modelo base se muestra con una respuesta real
 ya capturada), ya que mantener **dos** sesiones de generación simultáneas
 dejaba apenas ~20MB de margen antes del límite de Render.
 
+## Troubleshooting 3: cuatro intentos de deploy, y el primero "arreglo" no alcanzaba
+
+Lo de arriba (ONNX + cuantización) hizo falta, pero **no fue suficiente**.
+Esta es la cronología real, con números reales, de lo que costó dejar esto
+en pie en Render:
+
+| Intento | Cambio | Resultado |
+|---|---|---|
+| 1 | `torch` + `transformers` + `peft` directo, sin ONNX | OOM al arrancar — nunca abrió el puerto |
+| 2 | ONNX + `optimum` + cuantización INT8 | Build OK, pero el `buildCommand` de dos pasos instalaba a veces `torch` con CUDA (una condición de carrera) — OOM en cada solicitud |
+| 3 | Fijar versión exacta de `torch` + una sola instalación; además `intra_op_num_threads=1` y variables `OMP_NUM_THREADS=1` | Build limpio (confirmado `torch-2.14.1+cpu`, cero paquetes CUDA) — **igual** OOM en cada solicitud, 5 de 5 |
+| 4 | **Eliminar `torch`/`transformers`/`optimum` del todo** — `onnxruntime` + `tokenizers` puro, loop de generación a mano | Memoria medida en Render: ~240MB en reposo (antes: ~490MB) |
+
+### Cómo se encontró la causa real: medir en el lugar donde falla, no donde se puede
+
+Después de que el intento 3 fallara exactamente igual que el 2 (misma
+señal: `"Ran out of memory (used over 512MB)"`), quedó claro que razonar
+desde mediciones locales en Windows ya no alcanzaba — el intento 2 medía
+**~425-490MB estable en Windows**, pero fallaba 5 de 5 veces en el
+contenedor Linux real de Render. En vez de seguir ajustando a ciegas, se
+agregó logging de memoria (`psutil`) en cada etapa de `app.py`, directo a
+los logs de producción. Los números reales de Render (instancia `jlzmc`,
+intento 3) fueron:
+
+```
+[MEM] process start:            15.7 MB
+[MEM] after imports:            317.7 MB
+[MEM] after tokenizer loaded:   355.2 MB
+[MEM] after model loaded:       490.5 MB   <- ya al límite, antes de cualquier solicitud
+[MEM] generate() start:         505.6 MB   <- creció 15MB solo esperando, sin hacer nada
+[MEM] after tokenize:           506.0 MB
+[MEM] after generate() returns:  (nunca se imprimió -- el proceso murió acá)
+```
+
+Con el servidor recién levantado, **ya quedaban apenas 6MB de margen antes
+del límite de 512MB** — cualquier asignación de memoria real durante la
+generación (los tensores nuevos de cada paso autoregresivo) lo hacía
+cruzar la línea, siempre, de forma perfectamente reproducible.
+
+### La causa raíz: `torch` cuesta caro solo por existir, incluso sin usarlo para cómputo
+
+`optimum.onnxruntime.ORTModelForCausalLM` deja de usar los *kernels* de
+PyTorch para el cómputo pesado (esa parte sí la resolvió el cambio a
+ONNX) — pero **sigue necesitando `torch` instalado** para el manejo de
+tensores alrededor de `generate()`. Y resulta que el simple hecho de
+*importar* `torch` — sin ejecutar ni un solo tensor por sus kernels —
+cuesta **100-200MB de RAM** en este stack, consistente entre Windows y
+Linux. Con un modelo de apenas 82MB cuantizado, ese costo "gratis" del
+framework terminaba siendo varias veces el tamaño del modelo real.
+
+**La solución:** sacar `torch` del todo, no solo evitar sus kernels.
+`onnxruntime.InferenceSession` corre el grafo ONNX directamente con
+arrays de `numpy`, sin ninguna capa de PyTorch en el medio — el loop de
+generación token-por-token (manejo de *KV-cache* y muestreo top-p) se
+reimplementó a mano en unas pocas líneas (ver la sección de Inferencia
+arriba). Resultado medido en el mismo contenedor de Render: de ~490MB a
+**~240MB** en reposo, con márgen de sobra para generar sin problemas.
+
 ## ¿Por qué esto no era obvio desde el principio?
 
 A diferencia de un clasificador de imágenes o un detector de objetos
 (donde "un forward pass" es toda la inferencia), la generación
-autoregresiva de texto tiene un costo de *runtime* de PyTorch mucho más
-alto en proporción al tamaño real del modelo — para un modelo de 330MB,
-un ~60% de memoria adicional "gratis" del framework es un problema
-real. La lección concreta: **medir memoria real con una sola pasada antes
-de asumir que "el modelo es chico, va a entrar sin problema"** — el tamaño
-del modelo y el costo de correrlo no son lo mismo.
+autoregresiva de texto parecía necesitar inevitablemente un framework
+completo (`transformers`/`optimum`) para manejar el *KV-cache* — ONNX
+Runtime por sí solo, sin ayuda, parecía "demasiado bajo nivel". Pero el
+KV-cache no es más que nombres de entrada/salida en el grafo ONNX
+(`past_key_values.*` / `present.*`) y unos arrays de numpy que se van
+actualizando — nada que requiriera `torch`. La lección concreta: **medir
+memoria real, en el entorno real, antes de asumir qué tan "necesaria" es
+una dependencia** — tanto "el modelo es chico, va a entrar sin problema"
+como "esto es demasiado complejo para hacerlo sin el framework" resultaron
+ser suposiciones falsas, y las dos solo se pudieron descartar con datos,
+no con razonamiento.
 
 ## Cosas para probar, para afianzar la intuición
 

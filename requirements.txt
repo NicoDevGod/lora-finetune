@@ -1,6 +1,5 @@
-torch==2.14.1+cpu
 onnxruntime==1.23.2
-optimum[onnxruntime]==2.1.0
-transformers==4.45.2
+tokenizers==0.20.3
+numpy==2.2.6
 gradio==5.50.0
 psutil==6.1.0
