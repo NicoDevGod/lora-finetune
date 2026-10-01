@@ -1,4 +1,14 @@
 import os
+
+# Must be set before onnxruntime/torch load their native libraries -- a
+# container can report far more CPUs than a free-tier instance is actually
+# entitled to, and these libraries size their thread pools (and each
+# thread's own scratch buffers) off that count by default unless told
+# otherwise up front.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 from pathlib import Path
 
 import onnxruntime as ort
