@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 import gradio as gr
 
 ONNX_DIR = Path(__file__).parent / "onnx_lora"
-MAX_NEW_TOKENS = 32
+MAX_NEW_TOKENS = 24
 
 BASE_EXAMPLES = {
     "The weather today is": "The weather today is one of the worst in the entire world. The temperature on our planet is not bad, but it is a pretty good chance that you could find a new snowboard in your area.",
@@ -27,6 +27,13 @@ def load_model():
     session_options = ort.SessionOptions()
     session_options.enable_mem_pattern = False
     session_options.enable_cpu_mem_arena = False
+    # Linux containers report more CPUs than a free-tier instance is actually
+    # entitled to, and onnxruntime sizes its thread pool (plus each thread's
+    # scratch buffers) off that count by default -- pin both pools to 1
+    # thread so that doesn't silently multiply memory on a box we don't
+    # control the hardware_concurrency() reading of.
+    session_options.intra_op_num_threads = 1
+    session_options.inter_op_num_threads = 1
 
     tokenizer = AutoTokenizer.from_pretrained(ONNX_DIR)
     model = ORTModelForCausalLM.from_pretrained(ONNX_DIR, session_options=session_options)
